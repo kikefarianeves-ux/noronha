@@ -57,4 +57,93 @@ def fatores(h, t, d, total):
         "altura": clamp((h - H_MIN) / (H_FULL - H_MIN)),
         "periodo": clamp((t - T_MIN) / (T_FULL - T_MIN)),
         "direcao": dirf,
-        "dominancia": clamp((h / total) / DOM_F
+        "dominancia": clamp((h / total) / DOM_FULL),
+    }
+
+
+def nota(f):
+    # A direção funciona como porta: swell que não vem do setor certo não conta.
+    return round(100 * f["direcao"] * (0.5 * f["altura"] + 0.3 * f["periodo"] + 0.2 * f["dominancia"]), 1)
+
+
+def build(api, agora):
+    h = api["hourly"]
+    t = [datetime.fromisoformat(x) for x in h["time"]]
+    nivel = h["sea_level_height_msl"]
+    i = max(k for k, x in enumerate(t) if x <= agora)
+
+    # ---- Maré ----
+    frac = (agora - t[i]).total_seconds() / 3600
+    atual = nivel[i] + (nivel[i + 1] - nivel[i]) * frac
+    enchendo = nivel[i + 1] > nivel[i]
+    janela = [v for v in nivel[max(0, i - 12): i + 13] if v is not None]
+    media = sum(janela) / len(janela)
+    extremos = []
+    for k in range(i + 1, min(i + 49, len(t) - 1)):
+        a, b, c = nivel[k - 1], nivel[k], nivel[k + 1]
+        if None in (a, b, c):
+            continue
+        if b > a and b >= c:
+            extremos.append({"tipo": "alta", "hora": h["time"][k], "nivel_m": round(b, 2)})
+        elif b < a and b <= c:
+            extremos.append({"tipo": "baixa", "hora": h["time"][k], "nivel_m": round(b, 2)})
+
+    # ---- Swell: nota de 0 a 100 por hora, suavizada ----
+    F = [fatores(h["swell_wave_height"][k], h["swell_wave_period"][k],
+                 h["swell_wave_direction"][k], h["wave_height"][k]) for k in range(len(t))]
+    notas = [nota(f) for f in F]
+    suav = [sum(notas[max(0, k - SUAVIZAR_H + 1): k + 1]) / len(notas[max(0, k - SUAVIZAR_H + 1): k + 1])
+            for k in range(len(t))]
+    atual_nota = round(suav[i], 1)
+    situacao = "swell" if atual_nota >= SCORE_SWELL else "swell fraco" if atual_nota >= SCORE_FRACO else "sem swell"
+
+    inicio = None
+    if situacao != "swell":
+        for k in range(i + 1, len(t)):
+            if suav[k] >= SCORE_SWELL:
+                inicio = h["time"][k]
+                break
+    por_dia = {}
+    for k in range(i, len(t)):
+        d = h["time"][k][:10]
+        por_dia[d] = max(por_dia.get(d, 0), round(suav[k], 1))
+
+    hs, ts, ds = h["swell_wave_height"][i], h["swell_wave_period"][i], h["swell_wave_direction"][i]
+    na_temporada = agora.month in TEMPORADA_MESES
+    inicio_sazonal = None if na_temporada else str(datetime(agora.year, 12, 1).date())  # meses 4 a 11
+
+    return {
+        "atualizado_em": agora.isoformat(timespec="minutes"),
+        "fuso": TZ,
+        "mare": {
+            "nivel_atual_m": round(atual, 2),
+            "estado": "alta" if atual > media else "baixa",
+            "movimento": "enchendo" if enchendo else "vazando",
+            "proximos_extremos": extremos[:4],
+            "serie_48h": [{"hora": h["time"][k], "nivel_m": round(nivel[k], 2)}
+                          for k in range(i, min(i + 49, len(t))) if nivel[k] is not None],
+        },
+        "swell": {
+            "nota": atual_nota,
+            "situacao": situacao,
+            "em_epoca": situacao == "swell",
+            "altura_m": hs,
+            "periodo_s": ts,
+            "direcao_graus": ds,
+            "direcao_nome": PONTOS[round(ds / 22.5) % 16] if ds is not None else None,
+            "energia_kw_por_m": round(0.49 * hs * hs * ts, 1) if hs is not None and ts is not None else None,
+            "fatores_pct": {k: round(v * 100) for k, v in F[i].items()},
+            "proximo_inicio_previsto": inicio,
+            "temporada_sazonal": na_temporada,
+            "proximo_inicio_sazonal_estimado": inicio_sazonal,
+            "nota_maxima_por_dia": por_dia,
+            "criterios": {"nota_swell": SCORE_SWELL, "nota_fraco": SCORE_FRACO},
+        },
+    }
+
+
+if __name__ == "__main__":
+    dados = build(fetch(), datetime.now(ZoneInfo(TZ)).replace(tzinfo=None))
+    OUT.parent.mkdir(parents=True, exist_ok=True)
+    OUT.write_text(json.dumps(dados, ensure_ascii=False, indent=1), encoding="utf-8")
+    print("ok", dados["atualizado_em"], dados["swell"]["situacao"], dados["swell"]["nota"])
